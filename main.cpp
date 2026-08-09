@@ -20,6 +20,8 @@
 #include <ArduinoJson.h>
 #include <time.h>
 #include <esp_task_wdt.h>
+#include <memory> // std::make_shared, used by the /api/history chunked response
+#include <string.h> // memcpy, used by the /api/history chunked response
 #include "secrets.h" // WIFI_SSID/WIFI_PASSWORD - see secrets.h.example
 
 // ---------------- USER CONFIG ----------------
@@ -367,7 +369,7 @@ async function refreshHistory() {
     // real chunk of a cycle turns it into an actual duty percentage
     // trend. This only affects what gets drawn - the board still stores
     // (and /api/history still returns) the real per-minute values.
-    const DUTY_SMOOTHING_WINDOW = 15; // minutes
+    const DUTY_SMOOTHING_WINDOW = 240; // minutes
     function movingAverage(values, windowSize) {
       const out = new Array(values.length);
       let sum = 0;
@@ -395,7 +397,7 @@ async function refreshHistory() {
       dutyChart = new Chart(document.getElementById('dutyChart'), {
         type: 'line',
         data: { labels, datasets: [
-          { label: 'Duty cycle % (15min avg)', data: duty, borderColor:'#3ddc84', backgroundColor:'rgba(61,220,132,0.15)', fill:true, tension:0.3, pointRadius:0 }
+          { label: 'Duty cycle % (240 min avg)', data: duty, borderColor:'#3ddc84', backgroundColor:'rgba(61,220,132,0.15)', fill:true, tension:0.3, pointRadius:0 }
         ]},
         options: { responsive:true, animation:false,
           scales: { x: { ticks: { color:'#8ea0b3', maxTicksLimit:12 } }, y: { ticks: { color:'#8ea0b3' }, min:0, max:100 } },
@@ -427,7 +429,7 @@ setInterval(refreshHistory, 60000);
 // ---------------- Routes ----------------
 void setupRoutes() {
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
-    request->send_P(200, "text/html", INDEX_HTML);
+    request->send(200, "text/html", INDEX_HTML);
   });
 
   server.on("/api/live", HTTP_GET, [](AsyncWebServerRequest *request) {
@@ -450,24 +452,75 @@ void setupRoutes() {
   });
 
   server.on("/api/history", HTTP_GET, [](AsyncWebServerRequest *request) {
-    // Streamed instead of built as one big JsonDocument+String - at up to
-    // 1440 points, that was a single ~40-70KB contiguous allocation that
-    // got harder to satisfy the longer the board had been up and the
-    // more fragmented the heap got, which is exactly what was making the
-    // graphs silently stop appearing after some hours of uptime. Writing
-    // each point directly to the response as it's built needs only a
-    // small buffer at a time, regardless of how many points there are.
-    AsyncResponseStream *response = request->beginResponseStream("application/json");
-    response->print('[');
-    int start = (historyHead - historyCount + HISTORY_SIZE) % HISTORY_SIZE;
-    for (int i = 0; i < historyCount; i++) {
-      int idx = (start + i) % HISTORY_SIZE;
-      if (i > 0) response->print(',');
-      response->printf("{\"t\":%u,\"f\":%.2f,\"c\":%.2f,\"d\":%u}",
-                        history[idx].timestamp, history[idx].fridgeTemp,
-                        history[idx].crisperTemp, history[idx].dutyPercent);
-    }
-    response->print(']');
+    // beginResponseStream() (used previously here) is misleadingly named -
+    // despite the name, it still buffers the *entire* response internally
+    // as one String before sending, and multiple long-standing
+    // ESPAsyncWebServer issues document it becoming unreliable and
+    // truncating responses somewhere around 40-60KB. Our full 24h
+    // history response falls right in that range, which is what was
+    // causing "JSON.parse: end of data" - the response was getting cut
+    // off mid-stream, independent of how much free heap was available at
+    // the time. beginChunkedResponse() actually generates content on
+    // demand in small pieces as the network asks for more, so response
+    // size has no such ceiling - this per-request state struct tracks
+    // where we are in that generation between calls.
+    struct HistoryStreamState {
+      int index = 0;
+      int start = 0;
+      int count = 0;
+      String pending;
+      size_t pendingOffset = 0;
+      bool wroteOpen = false;
+      bool wroteClose = false;
+    };
+    auto st = std::make_shared<HistoryStreamState>();
+    st->start = (historyHead - historyCount + HISTORY_SIZE) % HISTORY_SIZE;
+    st->count = historyCount;
+
+    AsyncWebServerResponse *response = request->beginChunkedResponse(
+      "application/json",
+      [st](uint8_t *buffer, size_t maxLen, size_t /*index*/) -> size_t {
+        size_t written = 0;
+        while (written < maxLen) {
+          // Flush whatever text is left over from the last piece first.
+          if (st->pendingOffset < st->pending.length()) {
+            size_t avail = st->pending.length() - st->pendingOffset;
+            size_t remaining = maxLen - written;
+            size_t take = (avail < remaining) ? avail : remaining;
+            memcpy(buffer + written, st->pending.c_str() + st->pendingOffset, take);
+            written += take;
+            st->pendingOffset += take;
+            continue;
+          }
+          // Nothing pending - generate the next small piece.
+          if (!st->wroteOpen) {
+            st->pending = "[";
+            st->pendingOffset = 0;
+            st->wroteOpen = true;
+            continue;
+          }
+          if (st->index < st->count) {
+            int idx = (st->start + st->index) % HISTORY_SIZE;
+            char piece[80];
+            snprintf(piece, sizeof(piece), "%s{\"t\":%u,\"f\":%.2f,\"c\":%.2f,\"d\":%u}",
+                      (st->index > 0) ? "," : "",
+                      history[idx].timestamp, history[idx].fridgeTemp,
+                      history[idx].crisperTemp, history[idx].dutyPercent);
+            st->pending = piece;
+            st->pendingOffset = 0;
+            st->index++;
+            continue;
+          }
+          if (!st->wroteClose) {
+            st->pending = "]";
+            st->pendingOffset = 0;
+            st->wroteClose = true;
+            continue;
+          }
+          break; // nothing left at all - this and every future call returns 0, ending the response
+        }
+        return written;
+      });
     request->send(response);
   });
 }

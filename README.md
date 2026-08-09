@@ -150,16 +150,17 @@ project, deliberately different from each other for different purposes:
    representative of "how hard is this thing working right now" - 4
    hours smooths that out into something meaningful.
 3. **Graphed value** (the duty history chart only): a trailing
-   **15-minute** average, computed client-side in JavaScript over the
+   **30-minute** average, computed client-side in JavaScript over the
    same raw per-minute data. This one exists because a fridge compressor
    typically cycles over 10-30+ minutes, so at 1-minute resolution
    almost every point lands near 0% or 100% (it's rarely exactly
    mid-cycle when a given minute closes) - which looks like a plain
-   on/off square wave rather than a meaningful trend. 15 minutes is
-   enough to span a real chunk of a cycle without smoothing away all the
-   detail. This constant (`DUTY_SMOOTHING_WINDOW` in the page's
-   JavaScript) is easy to retune if 15 minutes ends up too smooth or too
-   jumpy once you're looking at real data.
+   on/off square wave rather than a meaningful trend. 30 minutes turned
+   out to be a better fit than the original 15-minute attempt, which
+   still looked too jumpy in practice. This constant
+   (`DUTY_SMOOTHING_WINDOW` in the page's JavaScript) is easy to retune
+   further if 30 minutes ends up too smooth or too jumpy once you're
+   looking at real data.
 
 None of this affects what's actually stored on the board - only #2 and
 #3 are display/reporting choices layered on top of the same raw #1 data.
@@ -207,13 +208,22 @@ points to a real leak; free heap much bigger than the largest block
 means fragmentation, not a leak; both low but stable and close together
 is just a tight-but-normal operating baseline.
 
-`/api/history`'s response streams directly rather than being built as
-one large in-memory string first, specifically so that endpoint doesn't
-need a single large contiguous allocation regardless of how full the
-24-hour history buffer gets - that used to be the thing most likely to
-fail first as heap got tighter over many hours of uptime, which is what
-was causing the history graphs to silently stop appearing without any
-other symptom.
+`/api/history` uses a genuinely chunked response (`beginChunkedResponse`)
+rather than building the JSON in one big buffer first - each history
+point gets generated on demand as the network asks for more, so response
+size has no memory ceiling regardless of how full the 24-hour history
+buffer gets. This wasn't the first attempt: an earlier version used
+`beginResponseStream`, which despite the name still buffers the *entire*
+response internally as one String before sending - it worked at first,
+but multiple long-standing `ESPAsyncWebServer` library issues document
+it becoming unreliable and truncating responses somewhere around
+40-60KB, which is roughly what a near-full 24h history payload comes to.
+That was the actual cause of the history graphs periodically going blank
+with no other symptom (heap could look perfectly healthy at the time,
+since the failure was a library limitation, not a memory shortage) - if
+you ever see `JSON.parse: end of data...` in the small error line above
+the card, that's this same class of problem resurfacing, and would be
+worth reporting/investigating rather than assuming it's transient.
 
 ## Troubleshooting
 
